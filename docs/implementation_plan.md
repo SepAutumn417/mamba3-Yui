@@ -391,47 +391,88 @@ Layer 3 — 仓位管理者 (PositionManager):
 
 ```mermaid
 graph LR
-    P1["阶段1<br>监督预训练<br>~50 epochs<br><b>学看盘</b>"] --> P2["阶段2<br>强化学习<br>~5M steps<br><b>学做决策</b>"] --> P3["阶段3<br>微调优化<br>~1M steps<br><b>精细打磨</b>"]
+    P1["阶段1<br>自监督+监督预训练<br>~50 epochs<br><b>学看盘</b>"] --> P2["阶段2<br>安全强化学习<br>~5M steps<br><b>学做决策</b>"] --> P3["阶段3<br>微调优化<br>~1M steps<br><b>精细打磨</b>"]
     
-    P1 -.- P1D["训练编码器+融合层<br>冻结: FinBERT<br>目标: 方向预测+波动率预测"]
-    P2 -.- P2D["训练分层Agent<br>冻结: 编码器(前期)<br>目标: 最大化风险调整收益"]
-    P3 -.- P3D["全参数微调<br>降低lr<br>目标: 消融实验+参数搜索"]
+    P1 -.- P1D["掩码重建+方向预测+波动率预测<br>自适应损失权重<br>CryptoBERT末2层微调"]
+    P2 -.- P2D["PPO-Lagrangian 安全RL<br>成本约束: 回撤<15%<br>智能体内在厌恶风险"]
+    P3 -.- P3D["全参数微调<br>降低lr<br>消融实验+参数搜索"]
 ```
 
-### 4.2 阶段 1: 监督预训练 — 学看盘
+### 4.2 阶段 1: 自监督 + 监督预训练 — 学看盘
 
-**目的**：让模型学会从多模态数据中提取有用特征。类比："教实习交易员认识 K 线形态、读懂新闻含义、理解宏观数据"。
+**目的**：让模型学会从多模态数据中提取有用特征。
+
+#### 4.2.1 自监督任务: 掩码时间序列重建 (Masked TS Modeling)
+
+```
+⭐ 深度优化 #1: 金融市场信噪比极低, 直接预测未来收益标签充满噪音。
+  加入自监督学习: 随机遮挡历史序列片段, 让模型重建缺失内容,
+  逼迫模型真正理解市场微观结构的动态演变。
+
+掩码策略:
+  对每个时间框架的输入序列:
+  - 随机选择 15% 的时间步
+  - 被选中的时间步: 80% 替换为 [MASK] token, 10% 替换为随机时间步, 10% 保持原样
+  - 掩码块长度: 1~5 根连续 K 线 (模拟连续缺失)
+  
+重建目标:
+  被遮挡的 K 线特征 (OHLCV + 技术指标) → MSE 重建损失
+  仅计算被遮挡位置的损失
+
+效果: 模型学会 "双底形态后面通常跟上涨" "量价背离后通常转向" 等模式,
+      而不是去拟合充满噪音的未来标签
+```
+
+#### 4.2.2 监督任务: 多目标预测
+
+```
+辅助预测头 (预训练后移除):
+  h_fused → Linear → 方向分类 (3类: 涨/跌/盘整)
+  h_fused → Linear → 收益率预测 (回归: 未来12根K线收益率)
+  h_fused → Linear → 波动率预测 (回归: 未来12根K线波动率)
+  h_fused → Linear → 市场状态分类 (4类: 趋势上/下/震荡/高波动)
+
+标签构造:
+  方向: 未来12根K线收盘价 vs 当前, 涨>0.5%=涨, 跌>0.5%=跌, 否则盘整
+  收益率: 未来12根K线的累积对数收益率
+  波动率: 未来12根K线的收益率标准差
+  市场状态: 基于滚动ADX+波动率历史分位数的规则标注
+```
+
+#### 4.2.3 自适应损失权重 (Uncertainty Weighting)
+
+```
+⭐ 深度优化 #3: 固定 w1*L1+w2*L2+... 容易导致某个任务
+  (如波动率预测) 主导梯度, 其它任务学不好。
+  
+  引入 Homoscedastic Uncertainty Weighting (Kendall et al. 2018):
+  每个任务 i 有一个可学习参数 log_sigma_i, 损失变为:
+    L_total = sum_i [ (1 / (2*sigma_i^2)) * L_i + log(sigma_i) ]
+    
+  效果: 
+  - sigma_i 大 → 该任务权重自动降低 ("这个任务噪声大, 别太信")
+  - sigma_i 小 → 该任务权重自动提高 ("这个任务信号清晰, 多学")
+  - log(sigma_i) 正则项防止所有权重趋于0
+
+最终损失:
+  L = L_mask_reconstruction          ← 自监督
+    + uncertainty_weighted(L_direction, L_return, L_volatility, L_regime)
+```
+
+#### 4.2.4 训练配置
 
 ```
 训练模块:
   ✅ 多时间框架编码器 (encoder.py)
-  ✅ 新闻情绪编码器 (news_encoder.py, FinBERT冻结)
+  ✅ 新闻情绪编码器 (news_encoder.py, CryptoBERT 末2层解冻)
   ✅ 上下文编码器组 (context_encoder.py)
   ✅ 跨模态融合 (fusion.py)
-  ✅ 市场状态检测器 (encoder.py)
-  ✅ 辅助预测头 (临时, 预训练后移除)
-  ❄️ FinBERT: 冻结
-
-辅助预测头:
-  h_fused → Linear → 方向分类 (3类: 涨/跌/盘整)
-  h_fused → Linear → 收益率预测 (回归: 未来12根K线收益率)
-  h_fused → Linear → 波动率预测 (回归: 未来12根K线波动率)
-  h_fused → Linear → 市场状态分类 (4类: 趋势↑/↓/震荡/高波动)
-
-标签构造:
-  方向: 未来12根K线收盘价 vs 当前收盘价, 涨>0.5%=涨, 跌>0.5%=跌, 否则盘整
-  收益率: 未来12根K线的累积对数收益率
-  波动率: 未来12根K线的收益率标准差
-  市场状态: 基于滚动ADX+波动率历史分位数的规则标注
-
-损失函数:
-  L = w1 × CrossEntropy(方向) + w2 × MSE(收益率) + w3 × MSE(波动率) + w4 × CrossEntropy(市场状态)
-  w1=1.0, w2=0.5, w3=0.3, w4=0.5
+  ✅ 掩码重建头 + 辅助预测头 (预训练后移除)
 
 优化器: AdamW (lr=3e-4, weight_decay=0.01)
 调度器: Cosine Annealing (warmup 5 epochs → cosine decay)
 批次: 64
-训练: 50 epochs, 早停 patience=10 (监控验证集方向预测准确率)
+训练: 50 epochs, 早停 patience=10
 混合精度: torch.amp.autocast('cuda')
 梯度裁剪: max_norm=1.0
 ```
@@ -501,42 +542,66 @@ reward_c = reward_b + entry_quality*0.1 + exit_quality*0.1 + trailing_stop*0.05
 )
 ```
 
-#### 4.3.3 PPO 算法配置
+#### 4.3.3 PPO-Lagrangian 安全强化学习
 
 ```
-算法: Proximal Policy Optimization (PPO)
+⭐ 深度优化 #2: PPO → PPO-Lagrangian (Safe RL)
+  原方案的风控是硬编码在环境中 (亏2%强平), 智能体本身没有"风险"概念。
+  PPO-Lagrangian 在训练目标中引入成本约束, 让智能体内在厌恶风险。
+
+算法: PPO-Lagrangian (Constrained MDP)
+  max_policy  E[reward]                    ← 最大化收益
+  subject to  E[cost] <= cost_limit        ← 约束回撤
+
+成本函数 (Cost Function):
+  c_t = max(0, current_drawdown - 0.10)    ← 回撤超过10%开始产生成本
+  cost_limit = 0.05                        ← 累积成本预算
+  
+  效果: 智能体必须在 "最大回撤 < 15%" 的约束下追求最大收益
+  Lagrangian乘子 lambda 自动调节:
+    - 回撤偏高时 lambda 上升 → 更保守
+    - 回撤安全时 lambda 下降 → 更激进
 
 分层训练策略:
   第一阶段 (0~1M steps): 
     训练 Layer1 (宏观决策), 冻结 Layer2/3 (用规则替代)
     冻结编码器 (使用预训练权重)
+    cost_limit 宽松 = 0.10
     
   第二阶段 (1M~3M steps):
     解冻 Layer2, 联合训练 Layer1+2
-    编码器低 lr 微调 (lr × 0.1)
+    编码器低 lr 微调 (lr * 0.1)
+    cost_limit 收紧 = 0.07
     
   第三阶段 (3M~5M steps):
     解冻 Layer3, 联合训练全部
     全参数微调 (降低 lr)
+    cost_limit 最终值 = 0.05
+```
 
-PPO 超参数:
-  rollout_steps: 2048      # 每次采集步数
-  ppo_epochs: 10            # 每批数据的训练轮数
-  batch_size: 256           # mini-batch 大小
-  lr: 1e-4                  # 学习率
-  gamma: 0.99               # 折扣因子
-  gae_lambda: 0.95          # GAE λ
-  clip_range: 0.2           # PPO 裁剪范围
-  entropy_coeff: 0.01       # 熵正则化 (鼓励探索)
-  value_coeff: 0.5          # 价值函数损失权重
-  max_grad_norm: 0.5        # 梯度裁剪
+```
+PPO-Lagrangian 超参数:
+  rollout_steps: 2048
+  ppo_epochs: 10
+  batch_size: 256
+  lr_policy: 1e-4
+  lr_lagrangian: 5e-3       # Lagrangian 乘子学习率 (较快收敛)
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  entropy_coeff: 0.01
+  value_coeff: 0.5
+  cost_value_coeff: 0.5     # 成本价值函数权重
+  max_grad_norm: 0.5
+  lagrangian_init: 0.01     # 初始乘子
+  lagrangian_max: 10.0      # 乘子上限
 
-并行环境: n_envs = 8 (8个独立环境同时采集经验)
+并行环境: n_envs = 8
 
 课程学习:
-  Phase A (0~1M): 只用趋势明显的历史片段 (ADX>25 的区间)
+  Phase A (0~1M): 只用趋势明显的历史片段 (ADX>25)
   Phase B (1M~3M): 混合趋势+震荡
-  Phase C (3M~5M): 全数据 (含极端行情: LUNA崩盘、FTX事件等)
+  Phase C (3M~5M): 全数据 (含极端: LUNA/FTX)
 ```
 
 ### 4.4 阶段 3: 微调与消融
