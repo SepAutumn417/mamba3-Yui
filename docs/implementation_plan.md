@@ -70,7 +70,7 @@ f:/mamba3_Yui/
 graph TB
     subgraph "信息输入层 — 五大维度"
         direction TB
-        I1["📊 技术面<br>5m/1h/4h/1D K线 + 技术指标"]
+        I1["📊 技术面<br>5m/15m/1h/4h/1D/1W K线 + 技术指标"]
         I2["📰 消息面<br>新闻标题 + 情绪评分"]
         I3["📋 合约面<br>资金费率/OI/基差"]
         I4["🔬 微观面<br>订单簿/多空比/清算区/VP"]
@@ -78,7 +78,7 @@ graph TB
     end
     
     subgraph "编码层 — 特征提取"
-        I1 --> E1["MultiTimeframeEncoder<br>4层 Mamba3 + CrossTF Attention"]
+        I1 --> E1["MultiTimeframeEncoder<br>6层 Mamba3 + CrossTF Attention"]
         I2 --> E2["SentimentEncoder<br>CryptoBERT(冻结) + Mamba3"]
         I3 --> E3["PerpEncoder<br>Linear + Mamba3"]
         I4 --> E4["MicroEncoder<br>Linear + Mamba3"]
@@ -142,15 +142,17 @@ Mamba3 Block 前向传播:
 #### 2.2.2 多时间框架编码器 (`encoder.py`)
 
 ```
-输入: 4个时间框架的 K 线特征
+输入: 6个时间框架的 K 线特征
   5m  features: (batch, 512, n_feat)  → LinearProj → Mamba3×4层 → h_5m
+  15m features: (batch, 512, n_feat)  → LinearProj → Mamba3×4层 → h_15m
   1h  features: (batch, 512, n_feat)  → LinearProj → Mamba3×6层 → h_1h  ← 主时间框架
   4h  features: (batch, 256, n_feat)  → LinearProj → Mamba3×4层 → h_4h
   1D  features: (batch, 128, n_feat)  → LinearProj → Mamba3×3层 → h_1d
+  1W  features: (batch, 64,  n_feat)  → LinearProj → Mamba3×2层 → h_1w
 
 跨时间框架融合:
   Query = h_1h (以交易级别为主视角)
-  Key/Value = concat(h_5m[-1], h_4h[-1], h_1d[-1])
+  Key/Value = concat(h_5m[-1], h_15m[-1], h_4h[-1], h_1d[-1], h_1w[-1])
   → CrossAttention → h_tech: (batch, seq_len, d_model)
 
 MarketRegimeDetector:
@@ -282,33 +284,44 @@ K 线形态 (模型辅助, 4维):
 #### 2.2.6 分层决策智能体 (`agent.py`)
 
 ```
-Layer 1 — 宏观决策者 (MacroAgent):
+⭐ 多频率分层激活机制 (Multi-Frequency Activation):
+  环境基础 Tick 为 5m (每根 5m K线收盘推进一步), 但各层激活频率不同, 模拟真人看盘习惯:
+  - Layer1: 每根 1h K线收盘时激活 (大级别看方向)
+  - Layer2: 每根 5m K线收盘时激活 (小级别找精确入场)
+  - Layer3: 有持仓时每根 5m K线收盘激活 (实时跟踪止损)
+
+Layer 1 — 宏观决策者 (MacroAgent, 1h 激活一次):
   输入: h_fused + regime_probs + trade_memory + account_state
   输出:
     direction_intent: Categorical(4) → 做多 / 做空 / 保持 / 全平
     confidence: Beta分布 → 0.0~1.0
   训练: PPO (独立策略头+价值头)
 
-Layer 2 — 战术执行者 (TacticalAgent):
+Layer 2 — 战术执行者 (TacticalAgent, 5m 激活一次):
   触发: Layer1 confidence > 0.6
   输入: h_fused + direction_intent + h_5m (精确入场信号)
   输出:
     execute: Categorical(3) → 立即执行 / 等待 / 放弃
-    stop_loss_atr: Box(0.5, 3.0) → 止损 = x × ATR
-    risk_reward: Box(1.5, 4.0) → 止盈 = ratio × 止损距离
+    stop_loss_atr: Box(0.5, 3.0) → 初始止损 = x * ATR(1h)
+    risk_reward: Box(1.5, 4.0) → 初始止盈 = ratio * 止损距离
   训练: PPO
 
-Layer 3 — 仓位管理者 (PositionManager):
+Layer 3 — 仓位管理者 (PositionManager, 5m 激活一次):
   触发: 有持仓时持续运行
   输入: 持仓状态 + 浮盈浮亏 + 市场状态变化
   输出:
     position_adjust: Categorical(4) → 保持 / 加仓+25% / 减仓-25% / 全平
-    trailing_stop: Box(0, 1) → 追踪止损强度
+    trailing_stop: Box(0, 1) → 追踪止损强度 (向当前价格收紧的比例)
   训练: PPO
+
+⭐ 止盈止损机制 (硬性反射弧, 实时触发):
+  Layer2/3 负责"设定"和"移动"止损价(SL)/止盈价(TP)。
+  环境(Env)负责在 5m K线内部检查 high/low 是否触碰 SL/TP。一旦触碰, 
+  立即强制平仓。这不需要模型推理参与, 就像真人的条件单(反射弧)。
 
 交易记忆 (TradeMemory):
   保存近 20 笔已平仓交易:
-    [方向, 持仓时长, 盈亏比, 入场市场状态, 出场原因]
+    [方向, 持仓时长, 盈亏比, 入场市场状态, 出场原因(止损/止盈/平仓)]
   → Linear → 128维向量 → 输入 Layer1
   效果: 连续亏损 → 自动降低信心 → 减小仓位
 ```
@@ -321,7 +334,7 @@ Layer 3 — 仓位管理者 (PositionManager):
 
 | 维度 | 数据项 | 来源 | 频率 | API |
 |---|---|---|---|---|
-| **技术面** | K线 OHLCV (4个时间框架) | Binance Futures | 5m/1h/4h/1D | `/fapi/v1/klines` |
+| **技术面** | K线 OHLCV (6个时间框架) | Binance Futures | 5m/15m/1h/4h/1D/1W | `/fapi/v1/klines` |
 | | 多品种 (ETH/SOL) | Binance Futures | 1h | 同上 |
 | **合约面** | 资金费率 | Binance Futures | 8h | `/fapi/v1/fundingRate` |
 | | 未平仓合约量 | Binance Futures | 5m | `/futures/data/openInterestHist` |
@@ -359,11 +372,13 @@ Layer 3 — 仓位管理者 (PositionManager):
    - 对所有连续特征, 用训练集 fit, 验证/测试集 transform
 
 2. 序列长度对齐:
-   5m: 512 步 = ~1.8天
-   1h: 512 步 = ~21天
-   4h: 256 步 = ~42天
-   1D: 128 步 = ~128天
-   确保: 每个1h K线对应12根5m K线; 每个4h对应4根1h
+   5m:  512 步 = ~1.8天
+   15m: 512 步 = ~5.3天
+   1h:  512 步 = ~21天
+   4h:  256 步 = ~42天
+   1D:  128 步 = ~128天
+   1W:  64 步  = ~1.2年
+   确保: 每根主级K线能在更低级别找到对应的子K线序列
 
 3. 时间序列分割 (严格按时间, 无数据泄露):
    训练集: 2020-01-01 ~ 2023-06-30 (70%)
@@ -382,9 +397,9 @@ Layer 3 — 仓位管理者 (PositionManager):
    强制延迟规则 (在 dataset.py 中硬编码):
    | 数据类别         | 延迟规则                               |
    |-----------------|---------------------------------------|
-   | 实时K线 5m/1h   | 当根K线收盘后才可用 (延迟=0)             |
-   | 4h K线          | 收盘后对齐到下一根1h                     |
-   | 日线            | 次日 00:00 UTC 才可用 (延迟>=1根K线)     |
+   | 实时K线 5m/15m/1h | 当根K线收盘后才可用 (延迟=0)             |
+   | 4h K线          | 收盘后对齐到下一根5m                     |
+   | 日线/周线        | 次日/次周 00:00 UTC 才可用 (延迟>=1根K线) |
    | 资金费率        | 结算后下一根K线才可用                     |
    | 订单簿快照      | 上一根K线的快照 (延迟1步)                |
    | 多空比/OI       | 上一数据点 (延迟1个周期)                  |
@@ -498,22 +513,22 @@ graph LR
 #### 4.3.1 交易环境 (`trading_env.py`)
 
 ```
-Episode 设计:
-  每个 Episode 从历史数据中随机截取 2000 根 1h K线 (~83天)
-  同时提供对应的 5m/4h/1D 数据和所有辅助数据
+Episode 设计 (基础 Tick = 5m K线):
+  每个 Episode 从历史数据中随机截取 8640 根 5m K线 (~30天)
+  环境每 step 向前推进 5 分钟
   
   结束条件:
     - 数据耗尽
     - 账户资金 ≤ 0 (强平)
-    - 达到最大 2000 步
+    - 达到最大 8640 步
 
 环境内置机制:
   ✅ 手续费: maker 0.02%, taker 0.04%
   ✅ 滑点: 0.01% + f(ATR, 成交量) 动态估计
   ✅ 资金费率: 每8h按真实历史数据结算
   ✅ 标记价格强平: 维持保证金率 < 阈值时触发
-  ✅ 止损/止盈自动触发: 用K线 high/low 判断是否触及
-  ✅ 追踪止损: 浮盈超过阈值后, 止损跟随价格移动
+  ✅ 止损/止盈自动触发: 在每个 5m step 内部, 检查 5m 实测 high/low 是否击穿 SL/TP; 击穿则触发条件单平仓 (不经过模型)
+  ✅ 追踪止损: PositionManager 调控, 止损价逐步沿价格移动
   ✅ 分批建仓/平仓: 每次调整 25% 仓位
   ✅ 单笔最大亏损: ≤ 总资金 2%
   ✅ 保证金缓冲: ≥ 30%
@@ -704,9 +719,11 @@ model:
   
   timeframes:
     5m:  { n_layer: 4, seq_len: 512 }
+    15m: { n_layer: 4, seq_len: 512 }
     1h:  { n_layer: 6, seq_len: 512 }
     4h:  { n_layer: 4, seq_len: 256 }
     1D:  { n_layer: 3, seq_len: 128 }
+    1W:  { n_layer: 2, seq_len: 64  }
   
   news_encoder:
     n_layer: 3
@@ -750,7 +767,8 @@ env:
   single_trade_max_loss: 0.02
   margin_buffer_ratio: 0.3
   use_mark_price_liquidation: true
-  episode_length: 2000
+  episode_length: 8640    # 5m steps, = 30 days
+  base_tick: "5m"
 
 # ═══ 阶段1: 自监督+监督预训练 ═══
 pretrain:
