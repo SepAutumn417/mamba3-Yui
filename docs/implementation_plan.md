@@ -79,7 +79,7 @@ graph TB
     
     subgraph "编码层 — 特征提取"
         I1 --> E1["MultiTimeframeEncoder<br>4层 Mamba3 + CrossTF Attention"]
-        I2 --> E2["SentimentEncoder<br>FinBERT(冻结) + Mamba3"]
+        I2 --> E2["SentimentEncoder<br>CryptoBERT(冻结) + Mamba3"]
         I3 --> E3["PerpEncoder<br>Linear + Mamba3"]
         I4 --> E4["MicroEncoder<br>Linear + Mamba3"]
         I5 --> E5["MacroEventEncoder<br>Linear + Mamba3"]
@@ -180,9 +180,15 @@ MarketRegimeDetector:
 ```
 数据源: CryptoNews API (免费, 含情绪评分, 历史追溯到2020)
 
+⚠️ 风险修复 #1: FinBERT → CryptoBERT
+  FinBERT 基于华尔街传统金融文本训练, 对 Crypto 黑话
+  (HODL, Rekt, Rug pull, FUD, To the moon) 理解不足, 会产生情绪误判。
+  替换为 ElKulako/cryptobert (HuggingFace, 专门针对 Crypto 推文训练)
+  预训练阶段: 解冻最后2层微调; RL阶段: 完全冻结
+
 处理流程:
-  新闻标题 → FinBERT tokenizer → token_ids
-  token_ids → FinBERT (冻结权重) → news_embedding (768维) + sentiment_probs (正/中/负)
+  新闻标题 → CryptoBERT tokenizer → token_ids
+  token_ids → CryptoBERT (末2层可微调) → news_embedding (768维)
   
   每根K线窗口内 0~10 条新闻:
     → Attention-Weighted Pooling (时效性加权: 越近权重越高)
@@ -352,8 +358,29 @@ Layer 3 — 仓位管理者 (PositionManager):
 
 4. 新闻数据对齐:
    每根 1h K线 → 收集该小时内所有新闻标题
-   → FinBERT tokenize → 存储 token_ids + 时间戳
+   → CryptoBERT tokenize → 存储 token_ids + 时间戳
    → 超过 10 条时, 保留情绪最极端的 10 条
+
+⚠️ 风险修复 #3: 强制数据延迟 (Anti Look-ahead Bias)
+5. 非实时数据强制 Lag:
+   多频率数据混合极易引入未来函数, 回测虚高实盘秒亏。
+   
+   强制延迟规则 (在 dataset.py 中硬编码):
+   | 数据类别         | 延迟规则                               |
+   |-----------------|---------------------------------------|
+   | 实时K线 5m/1h   | 当根K线收盘后才可用 (延迟=0)             |
+   | 4h K线          | 收盘后对齐到下一根1h                     |
+   | 日线            | 次日 00:00 UTC 才可用 (延迟>=1根K线)     |
+   | 资金费率        | 结算后下一根K线才可用                     |
+   | 订单簿快照      | 上一根K线的快照 (延迟1步)                |
+   | 多空比/OI       | 上一数据点 (延迟1个周期)                  |
+   | 恐惧贪婪指数    | 延迟1天                                |
+   | DXY/美债/美股   | 延迟1天 (日线收盘后次日才可用)            |
+   | 链上数据        | 延迟2小时 (确认+API发布延迟)             |
+   | USDT市值        | 延迟1天                                |
+   | 新闻            | 发布时间 < 当前K线开盘时间才可用          |
+   
+   验证: test_no_lookahead.py 逐特征检查时间戳合法性
 ```
 
 ---
@@ -435,34 +462,42 @@ Episode 设计:
   ✅ 分批建仓/平仓: 每次调整 25% 仓位
   ✅ 单笔最大亏损: ≤ 总资金 2%
   ✅ 保证金缓冲: ≥ 30%
+
+⚠️ 风险修复 #4: 环境性能向量化
+  RL需500万步交互, 8并行环境。纯Python循环+pandas会导致训练数周。
+  解决方案:
+  - 所有状态用预分配 NumPy 数组, 零动态分配
+  - 观察数据预加载到连续内存 (np.float32)
+  - 订单撮合/盈亏/保证金全部 NumPy 向量运算, 无 for 循环
+  - 8并行使用 gymnasium.vector.SyncVectorEnv
+  - 关键热路径 step/reset 用 @numba.njit 加速
+  - 目标: 单环境 >5000 steps/sec, 8并行 >30000 steps/sec
 ```
 
 #### 4.3.2 奖励函数
 
+```
+⚠️ 风险修复 #2: 分阶段渐进式奖励 (Anti Reward Hacking)
+  复杂奖励函数会导致智能体"卡BUG": 比如永久空仓可避开所有惩罚,
+  同时收获耐心奖励。解决方案: 奖励随训练阶段渐进式复杂化。
+  所有阶段都包含 inaction_penalty: 连续100步无交易 → -0.01/步 (防空仓陷阱)
+```
+
+**Phase A (0~1M steps) — 极简奖励，只学"会交易"**：
 ```python
-reward = (
-    # ═══ 盈亏核心 ═══
-    + realized_pnl                  # 平仓时的已实现盈亏
-    - trade_cost                    # 手续费 + 滑点
-    - funding_payment               # 资金费率支出
-    + unrealized_pnl_delta * 0.01   # 浮盈变化的微小奖励 (鼓励持有盈利仓)
+reward_a = realized_pnl - trade_cost - funding_payment - inaction_penalty
+```
 
-    # ═══ 交易质量 ═══
-    + entry_quality * 0.1           # 入场后价格直接朝有利方向 → 入场点好
-    + exit_quality * 0.1            # 止盈出场=+0.1, 止损出场=0, 强平=-0.5
-    + risk_reward_bonus * 0.2       # 实现盈亏比 > 2:1 → 额外奖励
+**Phase B (1M~3M steps) — 加入风险感知**：
+```python
+reward_b = reward_a + unrealized_pnl_delta*0.01 - drawdown*0.3 + cut_loss*0.1 + rr_bonus*0.2
+```
 
-    # ═══ 风险管理 ═══
-    - max_drawdown_penalty * 0.3    # 回撤超过10%开始惩罚
-    + trailing_stop_bonus * 0.05    # 使用追踪止损锁定利润 → 奖励
-    + cut_loss_bonus * 0.1          # 果断止损 (损失<1.5×ATR) → 奖励
-
-    # ═══ 纪律性 ═══
-    - overtrading_penalty * 0.1     # 24h 内交易 > 5 次 → 惩罚
-    - revenge_trade_penalty * 0.2   # 止损后 2 根 K 线内反向开仓 → 惩罚
-    + patience_bonus * 0.05         # 高信心 (>0.7) 才入场 → 奖励
-    + confluence_bonus * 0.15       # 多维度信号共振入场 → 奖励
-    + regime_alignment * 0.1        # 顺应市场状态 (趋势中顺势) → 奖励
+**Phase C (3M~5M steps) — 完整纪律性奖励**：
+```python
+reward_c = reward_b + entry_quality*0.1 + exit_quality*0.1 + trailing_stop*0.05
+         - overtrading*0.1 - revenge_trade*0.2 + patience*0.05 + confluence*0.15
+         + regime_alignment*0.1
 )
 ```
 
