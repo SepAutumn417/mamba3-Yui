@@ -33,7 +33,7 @@ f:/mamba3_Yui/
 │   │   ├── components.py         # 基础模块 (RMSNorm/SwiGLU/RoPE/SSD)
 │   │   ├── mamba3_core.py        # Mamba3 SSM 核心
 │   │   ├── encoder.py            # 多时间框架编码器 + 市场状态检测
-│   │   ├── news_encoder.py       # FinBERT 新闻情绪编码器
+│   │   ├── news_encoder.py       # CryptoBERT 新闻情绪编码器
 │   │   ├── context_encoder.py    # 合约/微观/宏观/事件 4子编码器
 │   │   ├── fusion.py             # 5路门控跨模态融合
 │   │   └── agent.py              # 分层决策 (宏观/战术/仓位) Actor-Critic
@@ -45,8 +45,8 @@ f:/mamba3_Yui/
 │   │   ├── microstructure.py     # 订单簿/清算区/Volume Profile
 │   │   └── dataset.py            # 多模态对齐 DataLoader
 │   ├── training/
-│   │   ├── pretrain.py           # 阶段1: 监督预训练
-│   │   ├── ppo.py                # 阶段2: PPO 强化学习
+│   │   ├── pretrain.py           # 阶段1: 自监督+监督预训练
+│   │   ├── ppo.py                # 阶段2: PPO-Lagrangian 安全RL
 │   │   └── trainer.py            # 统一训练管理
 │   └── backtest/
 │       ├── engine.py             # 回测引擎
@@ -334,7 +334,7 @@ Layer 3 — 仓位管理者 (PositionManager):
 | 微观结构 | 13 | 订单簿6 + 多空比3 + 清算区3 + VP1 |
 | 宏观联动 | 8 | DXY2 + 美债2 + 美股2 + 相关系数2 |
 | 事件 | 7 | 美联储3 + 代币1 + 减半1 + USDT1 + 链上1 |
-| 新闻情绪 | 768→d_model | FinBERT embedding |
+| 新闻情绪 | 768→d_model | CryptoBERT embedding |
 | 账户状态 | 7 | 持仓方向/比例/浮盈/保证金等 |
 | 交易记忆 | 128 | 近20笔交易编码 |
 
@@ -696,8 +696,9 @@ model:
   
   news_encoder:
     n_layer: 3
-    freeze_finbert: true
-    finbert_model: "ProsusAI/finbert"
+    base_model: "ElKulako/cryptobert"
+    freeze_strategy: "partial"
+    unfreeze_last_n_layers: 2
     max_headlines_per_bar: 10
   
   context_encoders:
@@ -737,7 +738,7 @@ env:
   use_mark_price_liquidation: true
   episode_length: 2000
 
-# ═══ 阶段1: 监督预训练 ═══
+# ═══ 阶段1: 自监督+监督预训练 ═══
 pretrain:
   epochs: 50
   batch_size: 64
@@ -746,26 +747,30 @@ pretrain:
   warmup_epochs: 5
   pred_horizon: 12
   early_stop_patience: 10
-  loss_weights:
-    direction: 1.0
-    return: 0.5
-    volatility: 0.3
-    regime: 0.5
+  mask_ratio: 0.15
+  mask_block_size: [1, 5]
+  loss_weighting: "uncertainty"   # auto-adaptive, not fixed
 
-# ═══ 阶段2: 强化学习 ═══
+# ═══ 阶段2: PPO-Lagrangian 安全RL ═══
 rl:
+  algorithm: "ppo_lagrangian"
   total_timesteps: 5_000_000
   n_envs: 8
   rollout_steps: 2048
   ppo_epochs: 10
   batch_size: 256
-  lr: 1.0e-4
+  lr_policy: 1.0e-4
+  lr_lagrangian: 5.0e-3
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
   entropy_coeff: 0.01
   value_coeff: 0.5
+  cost_value_coeff: 0.5
   max_grad_norm: 0.5
+  lagrangian_init: 0.01
+  lagrangian_max: 10.0
+  cost_limit_schedule: [0.10, 0.07, 0.05]
   curriculum:
     phase_a_steps: 1_000_000
     phase_b_steps: 2_000_000
@@ -797,7 +802,8 @@ pyarrow>=12.0.0
 pyyaml>=6.0
 requests>=2.31.0
 yfinance>=0.2.28
-transformers>=4.35.0    # FinBERT
+transformers>=4.35.0    # CryptoBERT
+numba>=0.58.0           # 环境向量化加速
 tensorboard>=2.14.0
 scikit-learn>=1.3.0
 matplotlib>=3.7.0
@@ -835,3 +841,20 @@ python scripts/train.py --ablation remove_micro
 - 回测: 夏普比率 > 0, Agent 行为合理
 - 共振测试: 多维度信号共振时入场，Agent 信心和仓位显著提高
 - 极端事件: LUNA/FTX 期间能识别并规避风险
+- 未来函数: test_no_lookahead.py 全特征时间戳合法性通过
+- 奖励黑客: 交易频率 > 10次/月 (排除永久空仓)
+- 安全RL: 测试集最大回撤 < 15% (PPO-Lagrangian 约束生效)
+
+---
+
+## 九、已知风险与对策
+
+| # | 风险 | 对策 | 状态 |
+|---|---|---|---|
+| 1 | FinBERT 对 Crypto 黑话水土不服 | 替换为 CryptoBERT，预训练解冻末2层微调 | ✅ |
+| 2 | 奖励函数过复杂导致 Reward Hacking | 分3阶段渐进引入 + inaction_penalty 防空仓 | ✅ |
+| 3 | 多频率数据混合引入未来函数 | 强制 Lag 延迟表 + 单元测试逐特征验证 | ✅ |
+| 4 | Gymnasium 环境 Python 循环性能瓶颈 | NumPy 预分配 + @numba.njit + SyncVectorEnv | ✅ |
+| 5 | 金融市场信噪比低，监督标签噪音大 | 加入掩码时间序列自监督学习 | ✅ |
+| 6 | 智能体无内在风险概念 | PPO-Lagrangian 安全RL + 成本约束 | ✅ |
+| 7 | 多任务梯度失衡 | Uncertainty Weighting 自适应损失权重 | ✅ |
