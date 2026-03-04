@@ -143,12 +143,12 @@ Mamba3 Block 前向传播:
 
 ```
 输入: 6个时间框架的 K 线特征
-  5m  features: (batch, 512, n_feat)  → LinearProj → Mamba3×4层 → h_5m
-  15m features: (batch, 512, n_feat)  → LinearProj → Mamba3×4层 → h_15m
-  1h  features: (batch, 512, n_feat)  → LinearProj → Mamba3×6层 → h_1h  ← 主时间框架
-  4h  features: (batch, 256, n_feat)  → LinearProj → Mamba3×4层 → h_4h
-  1D  features: (batch, 128, n_feat)  → LinearProj → Mamba3×3层 → h_1d
-  1W  features: (batch, 64,  n_feat)  → LinearProj → Mamba3×2层 → h_1w
+  5m  features: (batch, 2048, n_feat) → LinearProj → Mamba3×6层 → h_5m
+  15m features: (batch, 1024, n_feat) → LinearProj → Mamba3×6层 → h_15m
+  1h  features: (batch, 1024, n_feat) → LinearProj → Mamba3×12层 → h_1h  ← 主时间框架
+  4h  features: (batch, 512, n_feat)  → LinearProj → Mamba3×6层 → h_4h
+  1D  features: (batch, 256, n_feat)  → LinearProj → Mamba3×4层 → h_1d
+  1W  features: (batch, 128, n_feat)  → LinearProj → Mamba3×3层 → h_1w
 
 跨时间框架融合:
   Query = h_1h (以交易级别为主视角)
@@ -158,6 +158,7 @@ Mamba3 Block 前向传播:
 MarketRegimeDetector:
   h_tech → Linear → 4分类 (TREND_UP / TREND_DOWN / RANGE / HIGH_VOL)
 ```
+
 
 **技术面特征（每个时间框架独立计算）**：
 
@@ -371,13 +372,13 @@ Layer 3 — 仓位管理者 (PositionManager, 5m 激活一次):
 1. 标准化: RobustScaler (四分位数, 抗异常值)
    - 对所有连续特征, 用训练集 fit, 验证/测试集 transform
 
-2. 序列长度对齐:
-   5m:  512 步 = ~1.8天
-   15m: 512 步 = ~5.3天
-   1h:  512 步 = ~21天
-   4h:  256 步 = ~42天
-   1D:  128 步 = ~128天
-   1W:  64 步  = ~1.2年
+2. 序列长度对齐 (满血版设定 - 极大感受野):
+   5m:  2048 步 = ~7.1天 (全周微观细节)
+   15m: 1024 步 = ~10.6天
+   1h:  1024 步 = ~42.6天 (一个多月的宏观连续体)
+   4h:  512 步 = ~85.3天
+   1D:  256 步 = ~256天
+   1W:  128 步 = ~2.4年
    确保: 每根主级K线能在更低级别找到对应的子K线序列
 
 3. 时间序列分割 (严格按时间, 无数据泄露):
@@ -708,39 +709,40 @@ PPO-Lagrangian 超参数:
 
 ```yaml
 # configs/default.yaml
+# ⭐ 满血解锁版 (要求 >48GB VRAM 算力集群) ⭐
 
 # ═══ 模型架构 ═══
 model:
-  d_model: 256
-  d_state: 64
-  headdim: 32
-  chunk_size: 64
-  use_mimo: false
+  d_model: 512       # 满级宽度
+  d_state: 128       # 更大 SSM 状态容量
+  headdim: 64        
+  chunk_size: 128
+  use_mimo: true     # 开启 MIMO 增强表达力
   
   timeframes:
-    5m:  { n_layer: 4, seq_len: 512 }
-    15m: { n_layer: 4, seq_len: 512 }
-    1h:  { n_layer: 6, seq_len: 512 }
-    4h:  { n_layer: 4, seq_len: 256 }
-    1D:  { n_layer: 3, seq_len: 128 }
-    1W:  { n_layer: 2, seq_len: 64  }
+    5m:  { n_layer: 6, seq_len: 2048 }
+    15m: { n_layer: 6, seq_len: 1024 }
+    1h:  { n_layer: 12, seq_len: 1024 }  # 核心层深度翻倍
+    4h:  { n_layer: 6, seq_len: 512 }
+    1D:  { n_layer: 4, seq_len: 256 }
+    1W:  { n_layer: 3, seq_len: 128 }
   
   news_encoder:
-    n_layer: 3
+    n_layer: 4
     base_model: "ElKulako/cryptobert"
     freeze_strategy: "partial"
-    unfreeze_last_n_layers: 2
-    max_headlines_per_bar: 10
+    unfreeze_last_n_layers: 4    # 放开更多层微调
+    max_headlines_per_bar: 30    # 接收更多噪音内的高价值新闻
   
   context_encoders:
-    perp:   { n_layer: 2, n_features: 9 }
-    micro:  { n_layer: 2, n_features: 13 }
-    macro:  { n_layer: 2, n_features: 8 }
-    event:  { n_layer: 2, n_features: 7 }
+    perp:   { n_layer: 4, n_features: 9 }
+    micro:  { n_layer: 4, n_features: 13 }
+    macro:  { n_layer: 4, n_features: 8 }
+    event:  { n_layer: 4, n_features: 7 }
   
   fusion:
     type: "gated_cross_attention"
-    n_heads: 8
+    n_heads: 16      # 更多注意力头
   
   agent:
     trade_memory_size: 20
@@ -772,12 +774,13 @@ env:
 
 # ═══ 阶段1: 自监督+监督预训练 ═══
 pretrain:
-  epochs: 50
-  batch_size: 64
+  epochs: 100        # 满血算力支持更长周期
+  batch_size: 128    # 超大批次稳定梯度
   lr: 3.0e-4
   weight_decay: 0.01
-  warmup_epochs: 5
-  pred_horizon: 12
+  warmup_epochs: 10
+  pred_horizon: 24   # 预测更远的未来
+
   early_stop_patience: 10
   mask_ratio: 0.15
   mask_block_size: [1, 5]
@@ -786,11 +789,11 @@ pretrain:
 # ═══ 阶段2: PPO-Lagrangian 安全RL ═══
 rl:
   algorithm: "ppo_lagrangian"
-  total_timesteps: 5_000_000
-  n_envs: 8
-  rollout_steps: 2048
+  total_timesteps: 15_000_000   # 延长 3 倍交互时间
+  n_envs: 32                    # 并行宇宙火力全开，避免局部最优
+  rollout_steps: 8192           # 收集海量经验再更新
   ppo_epochs: 10
-  batch_size: 256
+  batch_size: 1024              # 适应海量 rollout 的大批次
   lr_policy: 1.0e-4
   lr_lagrangian: 5.0e-3
   gamma: 0.99
