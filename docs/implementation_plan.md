@@ -335,6 +335,16 @@ Layer 3 — 仓位管理者 (PositionManager, 5m 激活一次):
              MacroAgent 会自动降低整个加密货币敞口的置信度，收缩 BTC 仓位。
 
   → 将 (衰减本品记忆 + 跨品种池) → Linear → 128维向量 → 输入 Layer1
+
+⭐ 动态选币与多目标监控池 (AssetSelector):
+  模型不需要绑定死某一个币种，而是具备类似“雷达扫描”的自主选币能力。
+  - 监控广度: 每台 i5 推理机可以同时并发监控 50~100 个高流动性交易对。
+  - 动态剔除池: 每隔 1 小时，系统通过轻量级的预检测 (如价格异动率、合约持仓量突变) 
+    从 Binance 几百个币种中筛选出 Top 20 活跃币种扔给模型监控。
+  - 自主开单逻辑 (Winner Takes All): 
+    如果同时在 5 个币种上出现了开仓信号，模型会比较它们的 `confidence` (信心度) 
+    和 `regime_probs` (市场状态明确度)，仅挑选得分最高的 1~2 个币种执行开仓，
+    避免同一套资金在高度同质化的山寨币上重复暴露风险。
 ```
 
 ---
@@ -758,10 +768,12 @@ model:
     trade_memory_size: 20
     confidence_threshold: 0.6
 
-# ═══ 数据 ═══
+# ═══ 数据与监控池 ═══
 data:
-  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"] # 回测时的强相关品种
   primary_symbol: "BTCUSDT"
+  live_monitoring_pool_size: 50    # 实盘时同时监控的最大交易对数量
+  live_selection_top_k: 2          # 同时最多持仓的独立币种数
   start_date: "2020-01-01"
   macro_tickers: ["DX-Y.NYB", "^TNX", "^NDX", "^GSPC"]
   news_api: "cryptonews"
