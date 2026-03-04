@@ -158,21 +158,35 @@ MarketRegimeDetector:
 ```
 
 **技术面特征（每个时间框架独立计算）**：
+
 ```
-价格特征:
-  log_return, high_low_range, upper_shadow_ratio, lower_shadow_ratio, body_ratio
+⭐ 特征精简: 移除 Mamba3 可自动学习的冗余指标
+  传统技术指标 (RSI/MACD/Stoch/BB) 本质上都是 OHLCV 的确定性数学变换,
+  Mamba3 的 SSM 状态天然累积历史, 加上掩码自监督预训练,
+  模型能端到端地从原始数据中学到这些模式。
+  保留冗余指标反而会: (1)增加特征维度拖慢训练 (2)让掩码重建失去意义
 
-动量指标:
-  RSI(14), MACD(12,26,9), MACD_signal, MACD_hist, Stoch_K(14), Stoch_D, Williams_%R
+原始 K 线 (端到端学习, 5维):
+  open/close_norm          # 相对前收盘价归一化
+  high/low_norm            # 相对前收盘价归一化
+  log_return               # 对数收益率
 
-波动率指标:
-  ATR(14), BB_width(20,2), BB_position, historical_vol(20)
+K 线形态 (模型辅助, 4维):
+  body_ratio               # 实体占比 = |open-close| / (high-low)
+  upper_shadow_ratio       # 上影线占比
+  lower_shadow_ratio       # 下影线占比
+  high_low_range           # 振幅 = (high-low) / close
 
-成交量特征:
-  volume_ma_ratio(20), OBV_slope, VWAP_deviation
+不可替代指标 (模型难以自学, 3维):
+  ATR(14)                  # 平均真实波幅 — 止损/仓位归一化基准
+  VWAP_deviation           # 偏离成交量加权均价 — 机构级参考
+  volume_change            # 成交量相对20MA的比率
 
-时间编码:
-  hour_sin, hour_cos, weekday_sin, weekday_cos
+时间编码 (周期性节律, 4维):
+  hour_sin, hour_cos       # 24h 内的时间位置
+  weekday_sin, weekday_cos # 一周内的位置
+
+总计: ~16维/每时间框架 (原方案22维, 精简27%)
 ```
 
 #### 2.2.3 新闻情绪编码器 (`news_encoder.py`)
@@ -329,7 +343,7 @@ Layer 3 — 仓位管理者 (PositionManager):
 
 | 模块 | 特征数 | 说明 |
 |---|---|---|
-| 技术面 (每个TF) | ~22 | 价格5 + 动量7 + 波动率4 + 量4 + 时间2 |
+| 技术面 (每个TF) | ~16 | 原始OHLCV 5 + 形态4 + ATR/VWAP/量3 + 时间4 |
 | 永续合约 | 9 | 资金费率4 + OI2 + 基差3 |
 | 微观结构 | 13 | 订单簿6 + 多空比3 + 清算区3 + VP1 |
 | 宏观联动 | 8 | DXY2 + 美债2 + 美股2 + 相关系数2 |
